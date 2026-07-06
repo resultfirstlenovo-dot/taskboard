@@ -12,6 +12,8 @@ import streamlit as st
 from streamlit_sortables import sort_items
 from supabase import create_client
 
+import notifications as notif
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
@@ -20,6 +22,18 @@ st.set_page_config(page_title="TaskBoard", page_icon="🗂️", layout="wide")
 
 STATUSES = ["To Do", "In Progress", "Review", "Done"]
 STATUS_ICONS = {"To Do": "📋", "In Progress": "🔨", "Review": "🔍", "Done": "✅"}
+
+PRIORITIES = ["Urgent", "High", "Normal", "Low"]
+PRIORITY_ICONS = {"Urgent": "🔴", "High": "🟠", "Normal": "🔵", "Low": "⚪"}
+
+
+def priority_of(t):
+    p = t.get("priority") or "Normal"
+    return p if p in PRIORITIES else "Normal"
+
+
+def priority_rank(t):
+    return PRIORITIES.index(priority_of(t))
 
 SORTABLE_CSS = """
 .sortable-component {
@@ -94,6 +108,21 @@ def update_row(table, row_id, changes):
 
 def delete_row(table, row_id):
     sb.table(table).delete().eq("id", row_id).execute()
+
+
+def get_member_by_name(name):
+    if not name:
+        return None
+    rows = fetch("members", name=name)
+    return rows[0] if rows else None
+
+
+def notify_safely(fn, *args, **kwargs):
+    """Notifications must never break the board — log and move on if they fail."""
+    try:
+        fn(sb, *args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        st.toast(f"Notification not sent: {e}", icon="⚠️")
 
 
 # ----------------------------------------------------------------------------
@@ -188,7 +217,7 @@ def due_label(d):
 
 
 def task_card_label(t, subtasks_by_task):
-    parts = [f"#{t['id']}  {t['title']}"]
+    parts = [f"#{t['id']}  {PRIORITY_ICONS[priority_of(t)]} {t['title']}"]
     meta = []
     if t.get("assignee"):
         meta.append(f"👤 {t['assignee']}")
@@ -226,6 +255,96 @@ def load_project_data(project_id):
     for s in sorted(subs, key=lambda s: s["id"]):
         subs_by_task.setdefault(s["task_id"], []).append(s)
     return tasks, subs_by_task
+
+
+# ----------------------------------------------------------------------------
+# Alerts banner
+# ----------------------------------------------------------------------------
+
+def render_alerts(projects):
+    """Red-flag section at the very top: overdue, due today, and urgent tasks."""
+    proj_by_id = {p["id"]: p["name"] for p in projects}
+    open_tasks = [t for t in fetch("tasks") if t["status"] != "Done"]
+    today = date.today()
+
+    overdue, due_today, urgent = [], [], []
+    for t in open_tasks:
+        d = parse_date(t.get("due_date"))
+        if d and d < today:
+            overdue.append(t)
+        elif d and d == today:
+            due_today.append(t)
+        elif priority_of(t) == "Urgent":
+            urgent.append(t)  # urgent but not already listed above
+
+    def line(t):
+        d = parse_date(t.get("due_date"))
+        bits = [
+            f"**{t['title']}**",
+            f"📁 {proj_by_id.get(t['project_id'], '?')}",
+            f"👤 {t.get('assignee') or 'Unassigned'}",
+            f"{PRIORITY_ICONS[priority_of(t)]} {priority_of(t)}",
+        ]
+        if d:
+            bits.append(f"📅 {d.strftime('%d %b')}")
+        return " · ".join(bits)
+
+    n = len(overdue) + len(due_today) + len(urgent)
+    if n == 0:
+        st.success("✅ No overdue, due-today, or urgent items right now.")
+        return
+
+    with st.container(border=True):
+        st.markdown(f"### 🚨 Alerts — {n} item{'s' if n != 1 else ''} need attention")
+        for t in sorted(overdue, key=lambda t: (t.get("due_date") or "", priority_rank(t))):
+            st.error(f"⏰ OVERDUE — {line(t)}")
+        for t in sorted(due_today, key=priority_rank):
+            st.warning(f"📌 DUE TODAY — {line(t)}")
+        for t in sorted(urgent, key=lambda t: t.get("due_date") or "9999"):
+            st.warning(f"🔴 URGENT — {line(t)}")
+
+
+# ----------------------------------------------------------------------------
+# Vertical list view (Asana-style)
+# ----------------------------------------------------------------------------
+
+def render_list(project, member_filter=None):
+    tasks, subs_by_task = load_project_data(project["id"])
+    if member_filter:
+        tasks = [t for t in tasks if t.get("assignee") == member_filter]
+    if not tasks:
+        st.info("No tasks here yet." if not member_filter
+                else f"No tasks assigned to {member_filter} in this project.")
+        return
+
+    for status in STATUSES:
+        group = [t for t in tasks if t["status"] == status]
+        if not group:
+            continue
+        group.sort(key=lambda t: (priority_rank(t), t.get("due_date") or "9999", t["id"]))
+        st.markdown(f"#### {STATUS_ICONS[status]} {status} ({len(group)})")
+        for t in group:
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([5, 2, 2, 2])
+                with c1:
+                    st.markdown(f"**{t['title']}**")
+                    if t.get("description"):
+                        st.caption(t["description"])
+                    subs = subs_by_task.get(t["id"], [])
+                    if subs:
+                        done = sum(1 for s in subs if s["is_done"])
+                        with st.expander(f"☑ Subtasks {done}/{len(subs)}"):
+                            for s in subs:
+                                st.caption(("✅ " if s["is_done"] else "⬜ ") + s["title"])
+                with c2:
+                    p = priority_of(t)
+                    st.markdown(f"{PRIORITY_ICONS[p]} {p}")
+                with c3:
+                    st.markdown(f"👤 {t.get('assignee') or '—'}")
+                with c4:
+                    d = parse_date(t.get("due_date"))
+                    st.markdown(due_label(d) if d else "📅 —")
+        st.write("")
 
 
 # ----------------------------------------------------------------------------
@@ -271,6 +390,13 @@ def render_kanban(project, member_filter=None):
                 if current and (current["status"] != status or (current.get("position") or 0) != pos):
                     update_row("tasks", tid, {"status": status, "position": pos})
                     changed = True
+                    if current["status"] != status and current.get("assignee"):
+                        member = get_member_by_name(current["assignee"])
+                        updated_task = {**current, "status": status, "position": pos}
+                        notify_safely(
+                            notif.notify_task_updated, updated_task, project["name"],
+                            member, [f"Status changed to {status}"],
+                        )
         if changed:
             st.rerun()
         st.caption("Drag cards between columns to update status. Changes save automatically.")
@@ -283,7 +409,7 @@ def render_kanban(project, member_filter=None):
                 for t in [t for t in tasks if t["status"] == status]:
                     with st.container(border=True):
                         st.markdown(f"**{t['title']}**")
-                        meta = []
+                        meta = [f"{PRIORITY_ICONS[priority_of(t)]} {priority_of(t)}"]
                         if t.get("assignee"):
                             meta.append(f"👤 {t['assignee']}")
                         d = parse_date(t.get("due_date"))
@@ -318,23 +444,29 @@ def admin_task_manager(project, members):
         with st.form(f"add_task_{project['id']}", clear_on_submit=True):
             title = st.text_input("Title *")
             description = st.text_area("Description", height=80)
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             assignee = c1.selectbox("Assign to", ["—"] + member_names)
             due = c2.date_input("Due date", value=None)
             status = c3.selectbox("Status", STATUSES)
+            prio = c4.selectbox("Priority", PRIORITIES, index=2)
             if st.form_submit_button("Add task", width="stretch"):
                 if not title.strip():
                     st.error("Title is required.")
                 else:
-                    insert("tasks", {
+                    new_assignee = None if assignee == "—" else assignee
+                    inserted = insert("tasks", {
                         "project_id": project["id"],
                         "title": title.strip(),
                         "description": description.strip() or None,
-                        "assignee": None if assignee == "—" else assignee,
+                        "assignee": new_assignee,
                         "due_date": due.isoformat() if due else None,
                         "status": status,
+                        "priority": prio,
                         "position": len(tasks),
                     })
+                    if inserted and new_assignee:
+                        member = get_member_by_name(new_assignee)
+                        notify_safely(notif.notify_task_assigned, inserted[0], project["name"], member)
                     st.rerun()
 
     # ---- Edit / delete task ----
@@ -350,22 +482,53 @@ def admin_task_manager(project, members):
         with st.form(f"edit_task_{t['id']}"):
             title = st.text_input("Title", value=t["title"])
             description = st.text_area("Description", value=t.get("description") or "", height=80)
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             current_assignee = t.get("assignee")
             assignee_opts = ["—"] + member_names
             a_idx = assignee_opts.index(current_assignee) if current_assignee in assignee_opts else 0
             assignee = c1.selectbox("Assign to", assignee_opts, index=a_idx)
             due = c2.date_input("Due date", value=parse_date(t.get("due_date")))
             status = c3.selectbox("Status", STATUSES, index=STATUSES.index(t["status"]) if t["status"] in STATUSES else 0)
+            prio = c4.selectbox("Priority", PRIORITIES, index=priority_rank(t))
             b1, b2 = st.columns(2)
             if b1.form_submit_button("Save changes", width="stretch"):
+                new_assignee = None if assignee == "—" else assignee
+                new_due = due.isoformat() if due else None
+                new_description = description.strip() or None
+
+                changes = []
+                if title.strip() != t["title"]:
+                    changes.append(f"Title changed to “{title.strip()}”")
+                if new_description != t.get("description"):
+                    changes.append("Description updated")
+                if new_due != t.get("due_date"):
+                    changes.append(f"Due date changed to {new_due or 'none'}")
+                if status != t["status"]:
+                    changes.append(f"Status changed to {status}")
+                if prio != priority_of(t):
+                    changes.append(f"Priority changed to {prio}")
+                assignee_changed = new_assignee != t.get("assignee")
+
                 update_row("tasks", t["id"], {
                     "title": title.strip(),
-                    "description": description.strip() or None,
-                    "assignee": None if assignee == "—" else assignee,
-                    "due_date": due.isoformat() if due else None,
+                    "description": new_description,
+                    "assignee": new_assignee,
+                    "due_date": new_due,
                     "status": status,
+                    "priority": prio,
                 })
+
+                updated_task = {
+                    **t, "title": title.strip(), "description": new_description,
+                    "assignee": new_assignee, "due_date": new_due, "status": status,
+                    "priority": prio,
+                }
+                if assignee_changed and new_assignee:
+                    member = get_member_by_name(new_assignee)
+                    notify_safely(notif.notify_task_assigned, updated_task, project["name"], member)
+                elif changes and new_assignee:
+                    member = get_member_by_name(new_assignee)
+                    notify_safely(notif.notify_task_updated, updated_task, project["name"], member, changes)
                 st.rerun()
             if b2.form_submit_button("🗑 Delete task", width="stretch"):
                 delete_row("tasks", t["id"])
@@ -415,9 +578,10 @@ def admin_settings(projects, members):
     with c1:
         with st.form("add_member", clear_on_submit=True):
             name = st.text_input("New member name")
+            email = st.text_input("Email (needed for notifications)")
             if st.form_submit_button("Add member"):
                 if name.strip():
-                    insert("members", {"name": name.strip()})
+                    insert("members", {"name": name.strip(), "email": email.strip() or None})
                     st.rerun()
     with c2:
         if members:
@@ -426,6 +590,75 @@ def admin_settings(projects, members):
                 mid = next(m["id"] for m in members if m["name"] == doomed)
                 delete_row("members", mid)
                 st.rerun()
+
+    st.divider()
+    admin_notification_settings(members)
+
+
+def admin_notification_settings(members):
+    st.subheader("🔔 Notifications")
+
+    try:
+        settings_rows = fetch("app_settings", id=1)
+    except Exception:
+        st.warning(
+            "Notification tables aren't set up yet. Re-run the full **schema.sql** "
+            "in Supabase's SQL Editor (it's safe to run again — it won't touch your "
+            "existing data) to enable this section."
+        )
+        return
+    global_enabled = settings_rows[0]["notifications_enabled"] if settings_rows else True
+    new_global = st.toggle("Enable all email notifications (global switch)", value=global_enabled)
+    if new_global != global_enabled:
+        update_row("app_settings", 1, {"notifications_enabled": new_global})
+        st.rerun()
+
+    st.caption(
+        "Per-member email address and opt-in. A member only receives email if "
+        "the global switch above is on, their own switch below is on, AND "
+        "they have an email address set."
+    )
+    if not members:
+        st.caption("No team members yet.")
+        return
+
+    for m in members:
+        c1, c2, c3 = st.columns([2, 3, 1.4])
+        c1.markdown(f"**{m['name']}**")
+        new_email = c2.text_input(
+            "Email", value=m.get("email") or "", key=f"email_{m['id']}",
+            label_visibility="collapsed", placeholder="name@company.com",
+        )
+        new_enabled = c3.checkbox(
+            "Notify", value=m.get("notifications_enabled", True), key=f"notif_{m['id']}",
+        )
+        if new_email.strip() != (m.get("email") or ""):
+            update_row("members", m["id"], {"email": new_email.strip() or None})
+            st.rerun()
+        if new_enabled != m.get("notifications_enabled", True):
+            update_row("members", m["id"], {"notifications_enabled": new_enabled})
+            st.rerun()
+
+    with st.expander("📜 Recent notification log (troubleshooting)"):
+        try:
+            log = sb.table("notification_log").select("*").order("created_at", desc=True).limit(50).execute().data or []
+        except Exception:
+            st.caption("notification_log table not found — re-run schema.sql.")
+            return
+        if not log:
+            st.caption("No notifications sent yet.")
+        else:
+            st.dataframe(
+                [{
+                    "When": row["created_at"],
+                    "Type": row["notification_type"],
+                    "To": row.get("member_name") or "—",
+                    "Email": row.get("recipient_email") or "—",
+                    "Status": row["status"],
+                    "Error": row.get("error_message") or "",
+                } for row in log],
+                width="stretch", hide_index=True,
+            )
 
 
 # ----------------------------------------------------------------------------
@@ -479,8 +712,9 @@ def render_deliveries(projects, members):
         if not items:
             continue
         st.markdown(f"### {bucket} ({len(items)})")
-        items.sort(key=lambda t: (t.get("due_date") or "9999", t["id"]))
+        items.sort(key=lambda t: (t.get("due_date") or "9999", priority_rank(t), t["id"]))
         table = [{
+            "Priority": f"{PRIORITY_ICONS[priority_of(t)]} {priority_of(t)}",
             "Task": t["title"],
             "Project": proj_by_id.get(t["project_id"], "?"),
             "Assignee": t.get("assignee") or "—",
@@ -506,7 +740,7 @@ def render_my_tasks(projects, members):
         if not mine:
             continue
         st.markdown(f"#### 📁 {p['name']}")
-        render_kanban(p, member_filter=who)
+        render_list(p, member_filter=who)
 
 
 # ----------------------------------------------------------------------------
@@ -526,14 +760,22 @@ def main():
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
+        render_alerts(projects)
+        st.write("")
         if not projects:
             st.info("No projects yet." + (" Create one in the Settings tab." if is_admin()
                     else " Ask your coordinator to create one."))
         else:
+            c1, c2 = st.columns([3, 2])
             names = [p["name"] for p in projects]
-            picked = st.selectbox("Project", names, label_visibility="collapsed")
+            picked = c1.selectbox("Project", names, label_visibility="collapsed")
+            view = c2.radio("View", ["📃 List", "📊 Kanban"], horizontal=True,
+                            label_visibility="collapsed")
             project = next(p for p in projects if p["name"] == picked)
-            render_kanban(project)
+            if view == "📃 List":
+                render_list(project)
+            else:
+                render_kanban(project)
             if is_admin():
                 admin_task_manager(project, members)
 

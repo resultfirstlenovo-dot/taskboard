@@ -1,3 +1,7 @@
 .streamlit/secrets.toml
 __pycache__/
 *.pyc
+.claude/
+Archive.zip
+Archive 2/
+__MACOSX/
