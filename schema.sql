@@ -47,37 +47,3 @@ alter table subtasks disable row level security;
 insert into members (name) values
     ('Shrishti'), ('Shivam'), ('Mahendra'), ('Aman'), ('Neelee'), ('Ritu'), ('Yash')
 on conflict (name) do nothing;
-
--- ----------------------------------------------------------------------------
--- Notifications (Microsoft Graph email) — safe to re-run on an existing database
--- ----------------------------------------------------------------------------
-
-alter table members add column if not exists email text;
-alter table members add column if not exists notifications_enabled boolean not null default true;
-
--- Single-row table holding the global on/off switch
-create table if not exists app_settings (
-    id bigint primary key,
-    notifications_enabled boolean not null default true,
-    constraint app_settings_single_row check (id = 1)
-);
-insert into app_settings (id, notifications_enabled) values (1, true)
-on conflict (id) do nothing;
-
--- Every notification attempt is logged here. dedupe_key has a unique
--- constraint so the same event (task+type+day/minute bucket) can only ever
--- be recorded — and therefore sent — once.
-create table if not exists notification_log (
-    id bigint generated always as identity primary key,
-    dedupe_key text not null unique,
-    task_id bigint references tasks(id) on delete cascade,
-    member_name text,
-    notification_type text not null,
-    recipient_email text,
-    status text not null default 'pending',
-    error_message text,
-    created_at timestamptz default now()
-);
-
-alter table app_settings     disable row level security;
-alter table notification_log disable row level security;

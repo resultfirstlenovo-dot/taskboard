@@ -12,8 +12,6 @@ import streamlit as st
 from streamlit_sortables import sort_items
 from supabase import create_client
 
-import notifications as notif
-
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
@@ -108,21 +106,6 @@ def update_row(table, row_id, changes):
 
 def delete_row(table, row_id):
     sb.table(table).delete().eq("id", row_id).execute()
-
-
-def get_member_by_name(name):
-    if not name:
-        return None
-    rows = fetch("members", name=name)
-    return rows[0] if rows else None
-
-
-def notify_safely(fn, *args, **kwargs):
-    """Notifications must never break the board — log and move on if they fail."""
-    try:
-        fn(sb, *args, **kwargs)
-    except Exception as e:  # noqa: BLE001
-        st.toast(f"Notification not sent: {e}", icon="⚠️")
 
 
 # ----------------------------------------------------------------------------
@@ -390,13 +373,6 @@ def render_kanban(project, member_filter=None):
                 if current and (current["status"] != status or (current.get("position") or 0) != pos):
                     update_row("tasks", tid, {"status": status, "position": pos})
                     changed = True
-                    if current["status"] != status and current.get("assignee"):
-                        member = get_member_by_name(current["assignee"])
-                        updated_task = {**current, "status": status, "position": pos}
-                        notify_safely(
-                            notif.notify_task_updated, updated_task, project["name"],
-                            member, [f"Status changed to {status}"],
-                        )
         if changed:
             st.rerun()
         st.caption("Drag cards between columns to update status. Changes save automatically.")
@@ -454,7 +430,7 @@ def admin_task_manager(project, members):
                     st.error("Title is required.")
                 else:
                     new_assignee = None if assignee == "—" else assignee
-                    inserted = insert("tasks", {
+                    insert("tasks", {
                         "project_id": project["id"],
                         "title": title.strip(),
                         "description": description.strip() or None,
@@ -464,9 +440,6 @@ def admin_task_manager(project, members):
                         "priority": prio,
                         "position": len(tasks),
                     })
-                    if inserted and new_assignee:
-                        member = get_member_by_name(new_assignee)
-                        notify_safely(notif.notify_task_assigned, inserted[0], project["name"], member)
                     st.rerun()
 
     # ---- Edit / delete task ----
@@ -492,43 +465,14 @@ def admin_task_manager(project, members):
             prio = c4.selectbox("Priority", PRIORITIES, index=priority_rank(t))
             b1, b2 = st.columns(2)
             if b1.form_submit_button("Save changes", width="stretch"):
-                new_assignee = None if assignee == "—" else assignee
-                new_due = due.isoformat() if due else None
-                new_description = description.strip() or None
-
-                changes = []
-                if title.strip() != t["title"]:
-                    changes.append(f"Title changed to “{title.strip()}”")
-                if new_description != t.get("description"):
-                    changes.append("Description updated")
-                if new_due != t.get("due_date"):
-                    changes.append(f"Due date changed to {new_due or 'none'}")
-                if status != t["status"]:
-                    changes.append(f"Status changed to {status}")
-                if prio != priority_of(t):
-                    changes.append(f"Priority changed to {prio}")
-                assignee_changed = new_assignee != t.get("assignee")
-
                 update_row("tasks", t["id"], {
                     "title": title.strip(),
-                    "description": new_description,
-                    "assignee": new_assignee,
-                    "due_date": new_due,
+                    "description": description.strip() or None,
+                    "assignee": None if assignee == "—" else assignee,
+                    "due_date": due.isoformat() if due else None,
                     "status": status,
                     "priority": prio,
                 })
-
-                updated_task = {
-                    **t, "title": title.strip(), "description": new_description,
-                    "assignee": new_assignee, "due_date": new_due, "status": status,
-                    "priority": prio,
-                }
-                if assignee_changed and new_assignee:
-                    member = get_member_by_name(new_assignee)
-                    notify_safely(notif.notify_task_assigned, updated_task, project["name"], member)
-                elif changes and new_assignee:
-                    member = get_member_by_name(new_assignee)
-                    notify_safely(notif.notify_task_updated, updated_task, project["name"], member, changes)
                 st.rerun()
             if b2.form_submit_button("🗑 Delete task", width="stretch"):
                 delete_row("tasks", t["id"])
@@ -578,10 +522,9 @@ def admin_settings(projects, members):
     with c1:
         with st.form("add_member", clear_on_submit=True):
             name = st.text_input("New member name")
-            email = st.text_input("Email (needed for notifications)")
             if st.form_submit_button("Add member"):
                 if name.strip():
-                    insert("members", {"name": name.strip(), "email": email.strip() or None})
+                    insert("members", {"name": name.strip()})
                     st.rerun()
     with c2:
         if members:
@@ -590,75 +533,6 @@ def admin_settings(projects, members):
                 mid = next(m["id"] for m in members if m["name"] == doomed)
                 delete_row("members", mid)
                 st.rerun()
-
-    st.divider()
-    admin_notification_settings(members)
-
-
-def admin_notification_settings(members):
-    st.subheader("🔔 Notifications")
-
-    try:
-        settings_rows = fetch("app_settings", id=1)
-    except Exception:
-        st.warning(
-            "Notification tables aren't set up yet. Re-run the full **schema.sql** "
-            "in Supabase's SQL Editor (it's safe to run again — it won't touch your "
-            "existing data) to enable this section."
-        )
-        return
-    global_enabled = settings_rows[0]["notifications_enabled"] if settings_rows else True
-    new_global = st.toggle("Enable all email notifications (global switch)", value=global_enabled)
-    if new_global != global_enabled:
-        update_row("app_settings", 1, {"notifications_enabled": new_global})
-        st.rerun()
-
-    st.caption(
-        "Per-member email address and opt-in. A member only receives email if "
-        "the global switch above is on, their own switch below is on, AND "
-        "they have an email address set."
-    )
-    if not members:
-        st.caption("No team members yet.")
-        return
-
-    for m in members:
-        c1, c2, c3 = st.columns([2, 3, 1.4])
-        c1.markdown(f"**{m['name']}**")
-        new_email = c2.text_input(
-            "Email", value=m.get("email") or "", key=f"email_{m['id']}",
-            label_visibility="collapsed", placeholder="name@company.com",
-        )
-        new_enabled = c3.checkbox(
-            "Notify", value=m.get("notifications_enabled", True), key=f"notif_{m['id']}",
-        )
-        if new_email.strip() != (m.get("email") or ""):
-            update_row("members", m["id"], {"email": new_email.strip() or None})
-            st.rerun()
-        if new_enabled != m.get("notifications_enabled", True):
-            update_row("members", m["id"], {"notifications_enabled": new_enabled})
-            st.rerun()
-
-    with st.expander("📜 Recent notification log (troubleshooting)"):
-        try:
-            log = sb.table("notification_log").select("*").order("created_at", desc=True).limit(50).execute().data or []
-        except Exception:
-            st.caption("notification_log table not found — re-run schema.sql.")
-            return
-        if not log:
-            st.caption("No notifications sent yet.")
-        else:
-            st.dataframe(
-                [{
-                    "When": row["created_at"],
-                    "Type": row["notification_type"],
-                    "To": row.get("member_name") or "—",
-                    "Email": row.get("recipient_email") or "—",
-                    "Status": row["status"],
-                    "Error": row.get("error_message") or "",
-                } for row in log],
-                width="stretch", hide_index=True,
-            )
 
 
 # ----------------------------------------------------------------------------
