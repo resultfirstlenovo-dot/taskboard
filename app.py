@@ -9,6 +9,7 @@ TaskBoard — Kanban project management for a coordinator + 7 team members.
 from datetime import date, datetime, timedelta
 
 import streamlit as st
+from postgrest.exceptions import APIError
 from streamlit_sortables import sort_items
 from supabase import create_client
 
@@ -89,23 +90,45 @@ def get_client():
 sb = get_client()
 
 
+def _db_error(action, table, e):
+    st.error(
+        f"Database error while {action} **{table}**: {e.message or e}\n\n"
+        "If this mentions a missing column or table, ask your coordinator to "
+        "re-run the latest `schema.sql` in Supabase's SQL Editor — it's safe "
+        "to run again without touching existing data."
+    )
+    st.stop()
+
+
 def fetch(table, **filters):
     q = sb.table(table).select("*")
     for col, val in filters.items():
         q = q.eq(col, val)
-    return q.execute().data or []
+    try:
+        return q.execute().data or []
+    except APIError as e:
+        _db_error("reading", table, e)
 
 
 def insert(table, row):
-    return sb.table(table).insert(row).execute().data
+    try:
+        return sb.table(table).insert(row).execute().data
+    except APIError as e:
+        _db_error("saving to", table, e)
 
 
 def update_row(table, row_id, changes):
-    sb.table(table).update(changes).eq("id", row_id).execute()
+    try:
+        sb.table(table).update(changes).eq("id", row_id).execute()
+    except APIError as e:
+        _db_error("updating", table, e)
 
 
 def delete_row(table, row_id):
-    sb.table(table).delete().eq("id", row_id).execute()
+    try:
+        sb.table(table).delete().eq("id", row_id).execute()
+    except APIError as e:
+        _db_error("deleting from", table, e)
 
 
 # ----------------------------------------------------------------------------
@@ -224,30 +247,38 @@ def label_to_task_id(label):
         return None
 
 
-def load_project_data(project_id):
-    tasks = fetch("tasks", project_id=project_id)
-    tasks.sort(key=lambda t: (t.get("position") or 0, t["id"]))
+def load_all_data():
+    """One round trip for all tasks + subtasks, reused by every tab this run
+    instead of each view re-querying (previously up to ~15+ queries per
+    rerun with several projects; now a flat 2)."""
+    tasks = fetch("tasks")
     task_ids = [t["id"] for t in tasks]
     subs = []
     if task_ids:
-        subs = (
-            sb.table("subtasks").select("*").in_("task_id", task_ids).execute().data
-            or []
-        )
+        try:
+            subs = sb.table("subtasks").select("*").in_("task_id", task_ids).execute().data or []
+        except APIError as e:
+            _db_error("reading", "subtasks", e)
     subs_by_task = {}
     for s in sorted(subs, key=lambda s: s["id"]):
         subs_by_task.setdefault(s["task_id"], []).append(s)
     return tasks, subs_by_task
 
 
+def project_tasks(project_id, all_tasks):
+    tasks = [t for t in all_tasks if t["project_id"] == project_id]
+    tasks.sort(key=lambda t: (t.get("position") or 0, t["id"]))
+    return tasks
+
+
 # ----------------------------------------------------------------------------
 # Alerts banner
 # ----------------------------------------------------------------------------
 
-def render_alerts(projects):
+def render_alerts(projects, all_tasks):
     """Red-flag section at the very top: overdue, due today, and urgent tasks."""
     proj_by_id = {p["id"]: p["name"] for p in projects}
-    open_tasks = [t for t in fetch("tasks") if t["status"] != "Done"]
+    open_tasks = [t for t in all_tasks if t["status"] != "Done"]
     today = date.today()
 
     overdue, due_today, urgent = [], [], []
@@ -291,8 +322,8 @@ def render_alerts(projects):
 # Vertical list view (Asana-style)
 # ----------------------------------------------------------------------------
 
-def render_list(project, member_filter=None):
-    tasks, subs_by_task = load_project_data(project["id"])
+def render_list(project, all_tasks, subs_by_task, member_filter=None):
+    tasks = project_tasks(project["id"], all_tasks)
     if member_filter:
         tasks = [t for t in tasks if t.get("assignee") == member_filter]
     if not tasks:
@@ -334,16 +365,14 @@ def render_list(project, member_filter=None):
 # Kanban board
 # ----------------------------------------------------------------------------
 
-def render_kanban(project, member_filter=None):
-    tasks, subs_by_task = load_project_data(project["id"])
-    if member_filter:
-        tasks = [t for t in tasks if t.get("assignee") == member_filter]
+def render_kanban(project, all_tasks, subs_by_task):
+    tasks = project_tasks(project["id"], all_tasks)
 
     if not tasks:
-        st.info("No tasks here yet." if not member_filter else f"No tasks assigned to {member_filter} in this project.")
+        st.info("No tasks here yet.")
         return
 
-    if is_admin() and not member_filter:
+    if is_admin():
         # Drag & drop board
         containers = [
             {
@@ -407,8 +436,8 @@ def render_kanban(project, member_filter=None):
 # Admin: manage projects / tasks / subtasks / members
 # ----------------------------------------------------------------------------
 
-def admin_task_manager(project, members):
-    tasks, subs_by_task = load_project_data(project["id"])
+def admin_task_manager(project, members, all_tasks, subs_by_task):
+    tasks = project_tasks(project["id"], all_tasks)
     member_names = [m["name"] for m in members]
 
     st.divider()
@@ -539,10 +568,9 @@ def admin_settings(projects, members):
 # Deliveries dashboard
 # ----------------------------------------------------------------------------
 
-def render_deliveries(projects, members):
+def render_deliveries(projects, members, all_tasks):
     st.subheader("🚚 Deliveries by due date")
     proj_by_id = {p["id"]: p["name"] for p in projects}
-    all_tasks = fetch("tasks")
 
     c1, c2, c3 = st.columns(3)
     member_names = ["All members"] + [m["name"] for m in members]
@@ -602,19 +630,18 @@ def render_deliveries(projects, members):
 # "My tasks" view for team members
 # ----------------------------------------------------------------------------
 
-def render_my_tasks(projects, members):
+def render_my_tasks(projects, members, all_tasks, subs_by_task):
     st.subheader("🙋 My tasks")
     if not members:
         st.info("No team members configured yet.")
         return
     who = st.selectbox("I am…", [m["name"] for m in members])
     for p in projects:
-        tasks, _ = load_project_data(p["id"])
-        mine = [t for t in tasks if t.get("assignee") == who]
+        mine = [t for t in all_tasks if t["project_id"] == p["id"] and t.get("assignee") == who]
         if not mine:
             continue
         st.markdown(f"#### 📁 {p['name']}")
-        render_list(p, member_filter=who)
+        render_list(p, all_tasks, subs_by_task, member_filter=who)
 
 
 # ----------------------------------------------------------------------------
@@ -627,6 +654,7 @@ def main():
 
     projects = sorted(fetch("projects"), key=lambda p: p["id"])
     members = sorted(fetch("members"), key=lambda m: m["name"])
+    all_tasks, subs_by_task = load_all_data()
 
     tab_names = ["📋 Boards", "🙋 My tasks", "🚚 Deliveries"]
     if is_admin():
@@ -634,7 +662,7 @@ def main():
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
-        render_alerts(projects)
+        render_alerts(projects, all_tasks)
         st.write("")
         if not projects:
             st.info("No projects yet." + (" Create one in the Settings tab." if is_admin()
@@ -647,17 +675,17 @@ def main():
                             label_visibility="collapsed")
             project = next(p for p in projects if p["name"] == picked)
             if view == "📃 List":
-                render_list(project)
+                render_list(project, all_tasks, subs_by_task)
             else:
-                render_kanban(project)
+                render_kanban(project, all_tasks, subs_by_task)
             if is_admin():
-                admin_task_manager(project, members)
+                admin_task_manager(project, members, all_tasks, subs_by_task)
 
     with tabs[1]:
-        render_my_tasks(projects, members)
+        render_my_tasks(projects, members, all_tasks, subs_by_task)
 
     with tabs[2]:
-        render_deliveries(projects, members)
+        render_deliveries(projects, members, all_tasks)
 
     if is_admin():
         with tabs[3]:
